@@ -33,6 +33,61 @@ RECURRING_SECTION_LABELS: tuple[str, ...] = (
 )
 
 
+# ── Beat vs. fragment ─────────────────────────────────────────────────────
+# Same rules as the paid repair pipeline: rejoin only text broken mid-sentence;
+# when in doubt it is NOT damage (a false alarm is not a free scan, it's a lie).
+_SENTENCE_END = re.compile(r"[.!?…:][\"'”’)\]*_]*$")
+_OPENERS = "*_\"'“‘(["
+_URLISH = re.compile(
+    r"^(https?://\S+|www\.\S+|[\w.-]+\.(com|org|net|io|co|ai|app|edu|gov)(/\S*)?|\S+@\S+\.\w+)$", re.I)
+_EMPHASIZED = re.compile(r"^(\*{1,2}|_{1,2})(.+?)\1$")
+_STRUCTURAL = re.compile(r"^(chapter|part|book|section|act|prologue|epilogue|interlude|appendix)\b", re.I)
+_SMALL_WORDS = frozenset({"a", "an", "and", "at", "by", "for", "in", "of", "on", "or", "the", "to", "with"})
+
+
+def _ends_sentence(line: str) -> bool:
+    return bool(_SENTENCE_END.search(line.strip()))
+
+
+def _starts_sentence(line: str) -> bool:
+    s = line.strip().lstrip(_OPENERS)
+    return bool(s) and (s[0].isupper() or s[0].isdigit())
+
+
+def _ends_with_comma(line: str) -> bool:
+    return line.strip().rstrip("*_\"'”’)]").endswith((",", ";"))
+
+
+def _is_display(line: str) -> bool:
+    """Self-contained without a full stop: attributions, headings, contents
+    entries, ALL-CAPS or short Title Case lines, emphasized lines, URLs."""
+    s = line.strip()
+    if s.startswith(("—", "– ", "#")) or _URLISH.match(s) or _STRUCTURAL.match(s):
+        return True
+    m = _EMPHASIZED.match(s)
+    if m:
+        return not _ends_with_comma(m.group(2))
+    letters = [c for c in s if c.isalpha()]
+    if letters and all(c.isupper() for c in letters):
+        return True
+    words = s.split()
+    return 0 < len(words) <= 6 and words[0][:1].isupper() and all(
+        w[:1].isupper() or w[:1].isdigit() or w.lower() in _SMALL_WORDS for w in words)
+
+
+def _continues(prev: str, nxt: str) -> bool:
+    """True when `nxt` carries on a sentence that `prev` left unfinished."""
+    if _URLISH.match(nxt.strip()):
+        return False
+    if _ends_with_comma(prev):
+        return True
+    if nxt.strip().lstrip(_OPENERS)[:1].islower():
+        return True
+    if _ends_sentence(prev) or _is_display(prev):
+        return False
+    return not (_starts_sentence(nxt) and _ends_sentence(nxt))
+
+
 @dataclass(frozen=True)
 class ScanReport:
     """Counts of each kind of structural damage KAREN found."""
@@ -90,19 +145,24 @@ class Scanner:
 
     @staticmethod
     def _count_orphans(lines: list[str]) -> int:
+        """Short isolated lines that are pieces of a broken sentence.
+
+        A short line that is a complete sentence after a complete sentence
+        ("And yet.", "I opened it.") is the author's rhythm, not damage; nor are
+        display lines (names, attributions, contents entries, URLs)."""
         skip_prefixes = ("#", "**", "-", "*", "✦", ">", "`", "![")
         count = 0
         for i in range(1, len(lines) - 1):
             cur = lines[i].strip()
-            prev = lines[i - 1].strip()
-            nxt = lines[i + 1].strip()
-            if prev != "" or nxt != "":
+            if lines[i - 1].strip() != "" or lines[i + 1].strip() != "":
                 continue
-            if not cur or cur.startswith(skip_prefixes):
+            if not cur or cur.startswith(skip_prefixes) or cur[0].isdigit():
                 continue
             if len(cur.split()) > 4:
                 continue
-            if cur and not cur[0].isdigit():
+            prev_text = next((l.strip() for l in reversed(lines[:i]) if l.strip()), None)
+            next_text = next((l.strip() for l in lines[i + 1:] if l.strip()), None)
+            if (prev_text and _continues(prev_text, cur)) or (next_text and _continues(cur, next_text)):
                 count += 1
         return count
 
